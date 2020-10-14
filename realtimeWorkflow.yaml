@@ -1,0 +1,317 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: A real time wokflow sample
+
+Resources:
+  
+  IngestionBucket:
+    Type: AWS::S3::Bucket
+
+  
+  Logs:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /${AWS::StackName}/logs
+      RetentionInDays: 1
+  
+  LogsKinesis:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties: 
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        RoleARN: !GetAtt LogsServiceRole.Arn
+        BucketARN: !GetAtt IngestionBucket.Arn
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 3
+        CloudWatchLoggingOptions:
+          Enabled: False
+        CompressionFormat: UNCOMPRESSED
+        Prefix: aws-samples/logs/realtime
+        ProcessingConfiguration:
+          Enabled: true
+          Processors: 
+          - Type: Lambda
+            Parameters:
+            - ParameterName: LambdaArn
+              ParameterValue: !Sub ${TransformKinesisFunction.Arn}
+            - ParameterName: BufferSizeInMBs
+              ParameterValue: 3
+            - ParameterName: BufferIntervalInSeconds
+              ParameterValue: 60
+            
+  CloudWatchLogsToKinesis:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties: 
+      DestinationArn: !Sub ${LogsKinesis.Arn}
+      FilterPattern: ""
+      LogGroupName: !Sub ${Logs}
+      RoleArn: !Sub ${LogsToKinesisServiceRole.Arn}
+
+  LogsToKinesisServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action: sts:AssumeRole
+
+  LogsToKinesisRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}_logs_kineis_policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'firehose:*'
+            Resource:
+              - !Sub '${LogsKinesis.Arn}'
+          - Effect: Allow
+            Action:
+              - 'iam:PassRole'
+            Resource:
+              - !Sub '${LogsToKinesisServiceRole.Arn}'
+      Roles:
+        - !Ref 'LogsToKinesisServiceRole'
+  LogsServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+  LogsRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}_log_delivery_policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:*'
+            Resource:
+              - !Sub '${IngestionBucket.Arn}/*'
+              - !Sub '${IngestionBucket.Arn}'
+          - Effect: Allow
+            Action: 
+                - 'lambda:InvokeFunction'
+                - 'lambda:InvokeAsync'
+            Resource:
+              - !Sub '${TransformKinesisFunction.Arn}'
+      Roles:
+        - !Ref 'LogsServiceRole'
+
+  TransformKinesisFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AWSGlueConsoleFullAccess
+  TransformKinesisFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Runtime: python2.7
+      Description: ''
+      MemorySize: 512
+      Timeout: 60
+      Role: !GetAtt TransformKinesisFunctionRole.Arn
+      Code: 
+        ZipFile: !Sub |
+          import base64
+          import json
+          import gzip
+          import StringIO
+          import boto3
+
+          def transformLogEvent(log_event):
+              return log_event['message'] + '\n'
+              
+          def processRecords(records):
+              for r in records:
+                  data = base64.b64decode(r['data'])
+                  striodata = StringIO.StringIO(data)
+                  with gzip.GzipFile(fileobj=striodata, mode='r') as f:
+                      data = json.loads(f.read())
+
+                  recId = r['recordId']
+                  """
+                  CONTROL_MESSAGE are sent by CWL to check if the subscription is reachable.
+                  They do not contain actual data.
+                  """
+                  if data['messageType'] == 'CONTROL_MESSAGE':
+                      yield {
+                          'result': 'Dropped',
+                          'recordId': recId
+                      }
+                  elif data['messageType'] == 'DATA_MESSAGE':
+                      data = ''.join([transformLogEvent(e) for e in data['logEvents']])
+                      print data
+                      data = base64.b64encode(data)
+                      yield {
+                          'data': data,
+                          'result': 'Ok',
+                          'recordId': recId
+                      }
+                  else:
+                      yield {
+                          'result': 'ProcessingFailed',
+                          'recordId': recId
+                      }
+
+
+          def handler(event, context):
+              records = list(processRecords(event['records']))
+              
+              return {"records": records}
+
+  WriteLogsFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python2.7
+      Description: ''
+      MemorySize: 512
+      Timeout: 55
+      Role: !GetAtt TransformKinesisFunctionRole.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref IngestionBucket
+          LOG_GROUP_NAME: !Sub /${AWS::StackName}/logs
+      Code: 
+        ZipFile: !Sub |
+          import boto3
+          import random
+          import string
+          import uuid
+          import json
+          import os
+          import datetime
+          import calendar
+          import time
+          import urllib2
+
+          profiles = json.loads( '[{"ip":"34.209.30.165", "username":"mphillpottslx"},{"ip":"207.130.250.61", "username":"gmellandnr"},{"ip":"103.216.75.36", "username":"dwinpennyt"},{"ip":"147.148.138.187", "username":"tdevil2r"},{"ip":"142.117.198.234", "username":"mquipp3x"},{"ip":"254.207.60.76", "username":"lgrent5r"},{"ip":"206.126.42.113", "username":"eshiel6c"},{"ip":"186.138.30.219", "username":"ljepp9a"},{"ip":"22.165.3.106", "username":"nharbererd3"},{"ip":"97.26.163.162", "username":"gstonehewerda"},{"ip":"164.206.3.255", "username":"pbrixeyio"},{"ip":"128.222.151.43", "username":"ahakonssonp1"},{"ip":"6.167.223.77", "username":"sfaustinqa"},{"ip":"236.35.38.183", "username":"cdudinqy"},{"ip":"25.99.239.93", "username":"ccicconetti2s"},{"ip":"121.41.52.44", "username":"jgibbard3q"},{"ip":"133.12.214.53", "username":"abernade4h"},{"ip":"29.37.153.38", "username":"gskittrell64"},{"ip":"104.13.221.212", "username":"nwintle7z"},{"ip":"143.41.89.43", "username":"eyggo8x"},{"ip":"210.84.41.218", "username":"lclutterham9d"},{"ip":"208.116.109.154", "username":"mbowditcha6"},{"ip":"133.247.1.191", "username":"eeannettaei"},{"ip":"186.173.42.67", "username":"hverringfl"}] ')
+
+
+          requestUrls = ["GET /petstore/Fish/Feeders",
+                         "GET /petstore/Cats/DryFood",
+                         "GET /petstore/Bird/Etc"]
+
+          client = boto3.client('logs')
+
+          def lambda_handler(event, context):
+            timestamp = datetime.datetime.now()
+            nextSeqTokem = ""
+            logGroupName = os.environ['LOG_GROUP_NAME']
+            logStreamName = timestamp.strftime('%d-%b-%Y-%H-%M-%S') 
+
+            response = client.create_log_stream(
+                logGroupName=logGroupName,
+                logStreamName=logStreamName
+            )
+
+            waittime = 100 #write log every 100 ms
+
+            while context.get_remaining_time_in_millis() > (waittime+1000):
+              time.sleep(float(waittime)/1000.0)
+              profile = profiles[random.randint(0,len(profiles)-1)]
+              requestUrl = requestUrls[random.randint(0,len(requestUrls)-1)]
+              timestamp = datetime.datetime.now()
+              milliseconds = timestamp.microsecond / 1000
+              ts = calendar.timegm(timestamp.timetuple())*1000 + milliseconds
+              logentry = profile["ip"] + "," + profile["username"] + "," + timestamp.strftime('%d/%b/%Y:%H:%M:%S') + ",\"" + requestUrl +"\",200," + str(random.randint(300,1000))
+
+
+              if nextSeqTokem == "" : 
+                response = client.put_log_events(
+                    logGroupName=logGroupName,
+                    logStreamName=logStreamName,
+                    logEvents=[
+                        {
+                            'timestamp': ts,
+                            'message': logentry
+                        }
+                    ]
+                )
+                nextSeqTokem = response["nextSequenceToken"]
+              else:
+                response = client.put_log_events(
+                    logGroupName=logGroupName,
+                    logStreamName=logStreamName,
+                    logEvents=[
+                        {
+                            'timestamp': ts,
+                            'message': logentry
+                        }
+                    ],
+                    sequenceToken=nextSeqTokem
+                )
+
+                nextSeqTokem = response["nextSequenceToken"]
+              
+              waittime = random.randint(1,100)
+            
+            return context.get_remaining_time_in_millis()
+
+  SchedulerPolicyLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt WriteLogsFunction.Arn
+      Principal: events.amazonaws.com
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+
+  SchedulerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}_scheduler_policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: 
+                - 'lambda:InvokeFunction'
+                - 'lambda:InvokeAsync'
+            Resource:
+              - !Sub '${WriteLogsFunction.Arn}'
+      Roles:
+        - !Ref 'SchedulerRole'
+
+  EventScheduler:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: Triggers the data generation
+      RoleArn: !GetAtt SchedulerRole.Arn
+      ScheduleExpression: rate(1 minute)
+      Targets : 
+        - Id: !Sub SchedulerRole
+          Arn: !GetAtt WriteLogsFunction.Arn
+
